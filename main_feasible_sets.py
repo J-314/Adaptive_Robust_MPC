@@ -6,6 +6,8 @@ from joblib import Parallel, delayed
 from tqdm import tqdm
 import contextlib
 import joblib
+import pickle
+
 
 # ------------------------------------------------------------------
 # 1. UTILITIES FOR JOBLIB & TQDM
@@ -229,21 +231,33 @@ precomputed_params[5] = pack_hybrid_params(
     R_mat=R_scaled
 )
 
-def evaluate_point(x0, case_idx, params_dict):
-    """Parallel worker function."""
+def evaluate_chunk(points_chunk, case_idx, params_dict):
+    """
+    Worker function: Initializes the MPC controller exactly ONCE, 
+    then evaluates an entire batch of points using fast parameter updates.
+    """
     case_params = params_dict[case_idx]
     
     if case_params is None:
-        return 0 
+        return [0] * len(points_chunk)
         
-    sys_worker = utils.LTI_AFFINE(A_list, B_list, theta_true, x0)
+    # 1. Initialize the system and controller exactly ONCE per chunk
+    # (We use the first point as a temporary placeholder for the setup)
+    sys_worker = utils.LTI_AFFINE(A_list, B_list, theta_true, points_chunk[0])
     
     if case_idx == 0:
         mpc_worker = utils.MPC_POLY(sys_worker, case_params)
     else:
         mpc_worker = utils.MPC(sys_worker, case_params)
     
-    return is_mpc_feasible(mpc_worker, x0)
+    # 2. Loop through all points in the chunk and update the parameter
+    chunk_results = []
+    for x0 in points_chunk:
+        chunk_results.append(is_mpc_feasible(mpc_worker, x0))
+        
+    return chunk_results
+
+import os
 
 print("\n--- PHASE 2: High Resolution Parallel Evaluation ---")
 grid_resolution_x = 100
@@ -256,7 +270,12 @@ grid_y = np.linspace(y_min, y_max, grid_resolution_y)
 X1, X2 = np.meshgrid(grid_x, grid_y)
 grid_points = np.vstack([X1.ravel(), X2.ravel()]).T
 
-# Added the 6th configuration to the results dictionary
+# --- CHUNKING LOGIC ---
+# Determine how many chunks to create (e.g., 4 chunks per available CPU core)
+n_cores = max(1, os.cpu_count() - 1) 
+num_chunks = n_cores * 4
+point_chunks = np.array_split(grid_points, num_chunks)
+
 results = {
     'Polytopic Baseline': [],
     'Case 1 (Same Radii)': [],
@@ -273,10 +292,14 @@ for case_idx, case_name in enumerate(results.keys()):
         print(f"Skipping {case_name} grid evaluation (LMI was globally infeasible).")
         feasibility_array = [0] * len(grid_points)
     else:
-        tasks = [delayed(evaluate_point)(pt, case_idx, precomputed_params) for pt in grid_points]
+        # We now dispatch chunks instead of individual points
+        tasks = [delayed(evaluate_chunk)(chunk, case_idx, precomputed_params) for chunk in point_chunks]
         
         with tqdm_joblib(tqdm(desc="Evaluating Grid", total=len(tasks), smoothing=0.1)):
-            feasibility_array = Parallel(n_jobs=-2)(tasks)
+            chunked_results = Parallel(n_jobs=-2)(tasks)
+            
+        # Joblib returns a list of lists. We flatten it back into a single 1D array.
+        feasibility_array = [res for chunk in chunked_results for res in chunk]
         
     results[case_name] = np.array(feasibility_array).reshape(X1.shape)
 
@@ -307,3 +330,9 @@ for ax, (case_name, feasibility_grid), cmap in zip(axes, results.items(), colors
 axes[0].set_ylabel('$x_2$')
 plt.tight_layout()
 plt.show()
+
+filename = 'horizon' + str(Horizon)
+
+data = {'system':system_poly,'mpc_paramters': precomputed_params}
+with open ("results\\feasible_set\\" + filename,'wb') as file:
+    pickle.dump(data,file)
