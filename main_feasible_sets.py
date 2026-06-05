@@ -331,7 +331,7 @@ axes[0].set_ylabel('$x_2$')
 plt.tight_layout()
 plt.show()
 
-filename = 'horizon' + str(Horizon)
+filename = 'horizon' + str(Horizon) + '.pkl'
 
 data = {'system':system_poly,'mpc_paramters': precomputed_params}
 with open ("results\\feasible_set\\" + filename,'wb') as file:
